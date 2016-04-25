@@ -11,21 +11,18 @@
 
 #include "stdlib.h"
 #include "string.h"
+#include "unistd.h"
+
 
 using namespace std;
 
 
 
 /*
-
-
+    quick ref:
 
     hdfsFile hdfsOpenFile(hdfsFS fs, const char* path, int flags,
                           int bufferSize, short replication, tSize blocksize);
-
-
-
-
 */
 
 typedef std::lock_guard<std::mutex> mtx_guard;
@@ -73,11 +70,18 @@ struct seek_read_batch {
                   id(id), file_system(fs), entry_size(128), offset_minmax(seekrange)
   {
     for(unsigned int i=0;i<sources.size();i++) {
+      std::cout << "connecting to " << sources[i] << endl;;
       hdfsFile f = hdfsOpenFile(file_system, sources[i].c_str(), 0, 0, 0,0);
       if(!f)
         throw file_open_error("unable to open" + sources[i]);
       files.push_back(f);
+      std::cout << "opened " << sources[i] << endl;
     }
+  }
+
+  virtual ~seek_read_batch() {
+    //mtx_guard guard(mtx);
+    //close_all();
   }
 
   void cancel_all()
@@ -111,9 +115,13 @@ struct seek_read_batch {
       size_t bytes_offset = record_offset * 128;
 
       int res = hdfsPread(file_system, file, bytes_offset, record, 128);
-      if(res < 0)
-        throw file_read_error("");
+      if(res < 0) {
+        std::stringstream ss;
+        ss << "read failed with code " << res << " after " << read_count << " bytes ";
+        throw file_read_error(ss.str());
+      }
       //cout << (const char*)record << endl;
+      read_count += 128;
     }
 
   }
@@ -124,7 +132,11 @@ struct seek_read_batch {
     for(unsigned int i=0; i<files.size(); i++) {
       hdfsFile file = files[i];
       threads.push_back(std::thread([this, file](){
-        do_read(file);        
+        try {
+          do_read(file);
+        } catch (const file_read_error &e) {
+          cerr << "error after reading: " << e.what() << endl; 
+        }    
       }));
     }
 
@@ -174,8 +186,26 @@ int main() {
 
   // start firing off read batches
   seek_read_batch srb(0, fs, srcs, range(0, 1024*1024));
-  srb.run(11024*128);
 
+  cout << "launching 16 read loops" << endl;
+  std::thread t = std::thread(&seek_read_batch::run, &srb, 1024*128);
+
+  cout << "reading 128KB per source" << endl;
+  srb.run(1024*128);
+
+  cout << "sleeping to 1 second" << endl;
+  usleep(1000);
+
+  cout << "canceling all" << endl;
+  srb.cancel_all();
+  cout << "done cancelling" << endl;
+
+  cout << "joining async thread" << endl;
+  t.join();
+  cout << "async thread joined" << endl;
+
+
+  hdfsDisconnect(fs);
 }
 
 
